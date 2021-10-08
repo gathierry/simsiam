@@ -17,6 +17,7 @@ import warnings
 import torch
 import torch.nn as nn
 import torch.nn.parallel
+import torch.nn.functional as F
 import torch.backends.cudnn as cudnn
 import torch.distributed as dist
 import torch.optim
@@ -26,9 +27,11 @@ import torch.utils.data.distributed
 import torchvision.transforms as transforms
 import torchvision.datasets as datasets
 import torchvision.models as models
+from tqdm import tqdm
 
 import simsiam.loader
 import simsiam.builder
+import simsiam.subset
 
 model_names = sorted(name for name in models.__dict__
     if name.islower() and not name.startswith("__")
@@ -89,6 +92,12 @@ parser.add_argument('--pred-dim', default=512, type=int,
                     help='hidden dimension of the predictor (default: 512)')
 parser.add_argument('--fix-pred-lr', action='store_true',
                     help='Fix learning rate for the predictor')
+
+# knn monitor configs:
+parser.add_argument('--subset_list', default=None, type=str,
+                    help='path to a txt file listing subset of training set')
+parser.add_argument('--knn_k', default=200)
+parser.add_argument('--knn_t', default=0.2)
 
 def main():
     args = parser.parse_args()
@@ -237,19 +246,47 @@ def main_worker(gpu, ngpus_per_node, args):
         transforms.ToTensor(),
         normalize
     ]
+    test_transform = transforms.Compose(
+        [
+            transforms.Resize([256, 256]),
+            transforms.CenterCrop([224, 224]),
+            transforms.ToTensor(),
+            normalize,
+        ]
+    )
 
     train_dataset = datasets.ImageFolder(
         traindir,
         simsiam.loader.TwoCropsTransform(transforms.Compose(augmentation)))
 
+    memory_dataset = simsiam.subset.ImageFolderSubset(
+        args.val_subset,
+        root=traindir,
+        transform=test_transform,
+    )
+    test_dataset = datasets.ImageFolder(
+        root=os.path.join(args.data, 'val'),
+        transforms=test_transform,
+    )
+
     if args.distributed:
         train_sampler = torch.utils.data.distributed.DistributedSampler(train_dataset)
+        memory_sampler = torch.utils.data.distributed.DistributedSampler(memory_dataset)
+        test_sampler = torch.utils.data.distributed.DistributedSampler(test_dataset)
     else:
         train_sampler = None
+        memory_sampler = None
+        test_sampler = None
 
     train_loader = torch.utils.data.DataLoader(
         train_dataset, batch_size=args.batch_size, shuffle=(train_sampler is None),
         num_workers=args.workers, pin_memory=True, sampler=train_sampler, drop_last=True)
+    memory_loader = torch.utils.data.DataLoader(
+        memory_dataset, batch_size=args.batch_size, shuffle=False,
+        num_workers=args.workers, pin_memory=True, sampler=memory_sampler, drop_last=False)
+    test_loader = torch.utils.data.DataLoader(
+        test_dataset, batch_size=args.batch_size, shuffle=False,
+        num_workers=args.workers, pin_memory=True, sampler=test_sampler, drop_last=False)
 
     for epoch in range(args.start_epoch, args.epochs):
         if args.distributed:
@@ -267,6 +304,7 @@ def main_worker(gpu, ngpus_per_node, args):
                 'state_dict': model.state_dict(),
                 'optimizer' : optimizer.state_dict(),
             }, is_best=False, filename='checkpoint_{:04d}.pth.tar'.format(epoch))
+        validate(memory_loader, test_loader, model, epoch, args)
 
 
 def train(train_loader, model, criterion, optimizer, epoch, args):
@@ -307,6 +345,67 @@ def train(train_loader, model, criterion, optimizer, epoch, args):
 
         if i % args.print_freq == 0:
             progress.display(i)
+
+def validate(memory_loader, test_loader, model, epoch, args):
+    model.eval()
+    classes = len(memory_loader.dataset.classes)
+    total_top1, total_num, feature_bank, feature_labels = 0.0, 0, [], []
+    with torch.no_grad():
+        for data, target in tqdm(memory_loader, desc='Feature extracting'):
+            feature = model(data.cuda(args.gpu, non_blocking=True))
+            feature = F.normalize(feature, dim=1)
+            feature_bank.append(feature)
+            feature_labels.append(target.cuda(args.gpu, non_blocking=True))
+        feature_bank = torch.cat(feature_bank, dim=0)
+        feature_labels = torch.cat(feature_labels, dim=0)
+
+        feature_bank_list = [torch.zeros_like(feature_bank) for _ in range(args.world_size)]
+        torch.distributed.all_gather(feature_bank_list, feature_bank)
+        feature_bank = torch.cat(feature_bank_list, dim=0)  # [N, D]
+
+        feature_labels_list = [torch.zeros_like(feature_labels) for _ in range(args.world_size)]
+        torch.distributed.all_gather(feature_labels_list, feature_labels)
+        feature_labels = torch.cat(feature_labels_list, dim=0)
+
+        feature_bank = feature_bank.t().contiguous()  # [D, N]
+
+        # loop test data to predict the label by weighted knn search
+        test_bar = tqdm(test_loader)
+        for data, target in test_bar:
+            data, target = data.cuda(args.gpu, non_blocking=True), target.cuda(args.gpu, non_blocking=True)
+            feature = model(data)
+            feature = F.normalize(feature, dim=1)
+
+            pred_labels = knn_predict(feature, feature_bank, feature_labels, classes, knn_k=args.knn_k, knn_t=args.knn_t)
+
+            total_num += data.size(0)
+            total_top1 += (pred_labels[:, 0] == target).float().sum().item()
+            test_bar.set_description(
+                'Test Epoch: [{}/{}] Acc@1:{:.2f}%'.format(epoch, args.epochs, total_top1 / total_num * 100)
+            )
+    return total_top1 / total_num * 100
+
+
+# knn monitor as in InstDisc http://arxiv.org/abs/1805.01978
+# implementation follows http://github.com/zhirongw/lemniscate.pytorch and https://github.com/leftthomas/SimCLR
+def knn_predict(feature, feature_bank, feature_labels, classes, knn_k, knn_t):
+    # compute cos similarity between each feature vector and feature bank -> [B, N]
+    sim_matrix = torch.mm(feature, feature_bank)
+    # [B, K]
+    sim_weight, sim_indices = sim_matrix.topk(k=knn_k, dim=-1)
+    # [B, K]
+    sim_labels = torch.gather(feature_labels.expand(feature.size(0), -1), dim=-1, index=sim_indices)
+    sim_weight = (sim_weight / knn_t).exp()
+
+    # counts for each class
+    one_hot_label = torch.zeros(feature.size(0) * knn_k, classes, device=sim_labels.device)
+    # [B*K, C]
+    one_hot_label = one_hot_label.scatter(dim=-1, index=sim_labels.view(-1, 1), value=1.0)
+    # weighted score -> [B, C]
+    pred_scores = torch.sum(one_hot_label.view(feature.size(0), -1, classes) * sim_weight.unsqueeze(dim=-1), dim=1)
+
+    pred_labels = pred_scores.argsort(dim=-1, descending=True)
+    return pred_labels
 
 
 def save_checkpoint(state, is_best, filename='checkpoint.pth.tar'):

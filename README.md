@@ -1,3 +1,28 @@
+# SimSiam with KNN monitor
+
+This is a forked version of official SimSiam code + KNN monitor
+
+To do unsupervised pre-training of a ResNet-50 model on ImageNet in an 8-gpu machine with KNN monitor, run:
+```
+python main_simsiam.py \
+  -a resnet50 \
+  --dist-url 'tcp://localhost:10001' --multiprocessing-distributed --world-size 1 --rank 0 \
+  --fix-pred-lr \
+  --subset_list [SUBSET_TXT] \
+  [your imagenet-folder with train and val folders]
+
+```
+`SUBSET_TXT` can be downloaded from https://github.com/google-research/simclr/tree/master/imagenet_subsets
+It is a subset of ImageNet training set used for KNN monitor.
+
+Here's a result using `1percent.txt`.
+
+![](knn.png)
+
+
+
+---
+
 # SimSiam: Exploring Simple Siamese Representation Learning
 
 <p align="center">
